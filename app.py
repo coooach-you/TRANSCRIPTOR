@@ -1,12 +1,16 @@
 """
 Transcriptor – přepis s určením mluvčích (Soniox), překlad a shrnutí (Google Gemini).
 
-Spuštění:  streamlit run app.py   (nebo dvojklik na spustit.bat)
-Klíče:     SONIOX_API_KEY a GEMINI_API_KEY v souboru .env vedle app.py
+Verze pro PC:  streamlit run app.py (nebo dvojklik na spustit.bat), klíče v souboru .env,
+               přepisy ve složce na disku.
+Webová verze:  Streamlit Community Cloud, klíče v Secrets, přihlášení přes Google,
+               přepisy na Google Disku. Zapne se sama, když Secrets obsahují sekci [auth].
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -23,6 +27,8 @@ from google.genai import types
 from soniox import SonioxClient
 from soniox.types import CreateTranscriptionConfig, StructuredContext
 
+from storage import DriveStorage, LocalStorage, drive_auth_url, drive_exchange_code
+
 # ======================================================================================
 # Nastavení (ověřeno k 21. 11. 2026)
 # ======================================================================================
@@ -30,6 +36,22 @@ from soniox.types import CreateTranscriptionConfig, StructuredContext
 APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR / ".env")
 DEFAULT_OUTPUT_DIR = APP_DIR / "vystupy"
+
+
+def secrets() -> dict:
+    """Obsah Secrets (webová verze). Na PC soubor se Secrets obvykle není, pak je prázdný."""
+    try:
+        return st.secrets.to_dict()
+    except Exception:  # noqa: BLE001 – žádný soubor secrets.toml
+        return {}
+
+
+SECRETS = secrets()
+WEB = "auth" in SECRETS  # webová verze s přihlášením
+
+
+def cfg(key: str, default: str = "") -> str:
+    return str(SECRETS.get(key) or os.getenv(key) or default).strip()
 
 
 def output_dir() -> Path:
@@ -92,12 +114,13 @@ SUMMARY_TEMPLATES = {
 # ======================================================================================
 
 
-def soniox_transcribe(api_key: str, filename: str, data: bytes, language_hints: list[str],
-                      terms: list[str], on_status) -> tuple[list[dict], float]:
-    """Nahraje soubor do Sonioxu, počká na přepis a vrátí (tokeny, délka v minutách).
+class SonioxFailed(RuntimeError):
+    """Soniox přepis odmítl nebo selhal (na rozdíl od přerušeného čekání)."""
 
-    Soubor i přepis se na serveru Sonioxu po stažení vždy smažou (i při chybě).
-    """
+
+def soniox_start(api_key: str, filename: str, fileobj, language_hints: list[str],
+                 terms: list[str]) -> tuple[str, str]:
+    """Nahraje soubor do Sonioxu a spustí přepis. Vrátí (id přepisu, id souboru)."""
     config = CreateTranscriptionConfig(
         language_hints=language_hints or None,
         enable_speaker_diarization=True,
@@ -105,30 +128,47 @@ def soniox_transcribe(api_key: str, filename: str, data: bytes, language_hints: 
         context=StructuredContext(terms=terms) if terms else None,
     )
     with SonioxClient(api_key=api_key, timeout_sec=600) as client:
-        on_status("Nahrávám soubor do Sonioxu…")
-        uploaded = client.files.upload(data, filename=filename)
-        transcription_id = None
+        uploaded = client.files.upload(fileobj, filename=filename)
         try:
             job = client.stt.create(model=SONIOX_MODEL, file_id=uploaded.id, config=config)
-            transcription_id = job.id
-            started = time.monotonic()
-            while job.status in ("queued", "processing"):
-                waited = int(time.monotonic() - started)
-                on_status(f"Soniox přepisuje… ({waited // 60} min {waited % 60:02d} s)")
-                if waited > 3 * 3600:
-                    raise TimeoutError("Přepis trvá déle než 3 hodiny, zkuste to později.")
-                time.sleep(5)
-                job = client.stt.get(transcription_id)
-            if job.status != "completed":
-                raise RuntimeError(f"Soniox hlásí chybu: {job.error_type}: {job.error_message}")
-            transcript = client.stt.get_transcript(transcription_id)
-            tokens = [t.model_dump() for t in transcript.tokens]
-            minutes = (job.audio_duration_ms or 0) / 60_000
-            return tokens, minutes
-        finally:
+        except Exception:
+            client.files.delete_if_exists(uploaded.id)
+            raise
+        return job.id, uploaded.id
+
+
+def soniox_wait(api_key: str, transcription_id: str, on_status) -> tuple[list[dict], float]:
+    """Počká na hotový přepis a vrátí (tokeny, délka v minutách).
+
+    Když se čekání přeruší (zavřený prohlížeč v mobilu), přepis u Sonioxu zůstane
+    a jde ho dokončit později tlačítkem „Dokončit“ v postranním panelu.
+    """
+    with SonioxClient(api_key=api_key, timeout_sec=600) as client:
+        job = client.stt.get(transcription_id)
+        started = time.monotonic()
+        while job.status in ("queued", "processing"):
+            waited = int(time.monotonic() - started)
+            on_status(f"Soniox přepisuje… ({waited // 60} min {waited % 60:02d} s)")
+            if waited > 3 * 3600:
+                raise TimeoutError("Přepis trvá déle než 3 hodiny, zkuste ho dokončit později.")
+            time.sleep(5)
+            job = client.stt.get(transcription_id)
+        if job.status != "completed":
+            raise SonioxFailed(f"Soniox hlásí chybu: {job.error_type}: {job.error_message}")
+        transcript = client.stt.get_transcript(transcription_id)
+        return [t.model_dump() for t in transcript.tokens], (job.audio_duration_ms or 0) / 60_000
+
+
+def soniox_cleanup(api_key: str, transcription_id: str, file_id: str):
+    """Smaže soubor i přepis ze serveru Sonioxu (až když je přepis bezpečně uložený)."""
+    try:
+        with SonioxClient(api_key=api_key, timeout_sec=60) as client:
             if transcription_id:
                 client.stt.delete_if_exists(transcription_id)
-            client.files.delete_if_exists(uploaded.id)
+            if file_id:
+                client.files.delete_if_exists(file_id)
+    except Exception:  # noqa: BLE001 – nevadí, Soniox soubory sám maže po 30 dnech
+        pass
 
 
 def tokens_to_segments(tokens: list[dict]) -> list[dict]:
@@ -219,7 +259,8 @@ LAYOUTS = {"separate": "Zvlášť (přepis a překlad jako dva dokumenty)",
 
 
 def current_layout() -> str:
-    return os.getenv("LAYOUT", "separate") if os.getenv("LAYOUT") in LAYOUTS else "separate"
+    layout = get_setting("LAYOUT")
+    return layout if layout in LAYOUTS else "separate"
 
 
 def transcript_documents(data: dict, names: dict) -> list[tuple[str, str, str, str]]:
@@ -356,37 +397,73 @@ def safe_name(text: str) -> str:
     return text[:60] or "nahravka"
 
 
-def _write_atomic(path: Path, data: bytes):
-    """Zapíše soubor najednou, aby Google Disk nikdy nesynchronizoval rozepsanou verzi."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+# --- Kam se ukládá: složka na PC, nebo Google Disk (webová verze) --------------------------
+
+
+@st.cache_resource(show_spinner=False)
+def drive_storage(folder: str, client_id: str, client_secret: str, token: str) -> DriveStorage:
+    return DriveStorage(folder, client_id, client_secret, token)
+
+
+def storage():
+    if WEB:
+        auth = SECRETS["auth"]
+        return drive_storage(cfg("DRIVE_FOLDER", "Transcriptions"), auth.get("client_id", ""),
+                             auth.get("client_secret", ""), cfg("DRIVE_REFRESH_TOKEN"))
+    return LocalStorage(output_dir())
+
+
+def get_setting(key: str) -> str:
+    if not WEB:
+        return os.getenv(key, "")
+    s = st.session_state
+    if "_settings" not in s:
+        try:
+            s._settings = storage().get_settings()
+        except Exception:  # noqa: BLE001
+            s._settings = {}
+    return s._settings.get(key, "")
+
+
+def set_setting(key: str, value: str):
+    if not WEB:
+        update_env({key: value})
+        return
+    storage().set_settings({key: value})
+    st.session_state._settings = {**st.session_state.get("_settings", {}), key: value}
+
+
+def new_job_id(source_name: str) -> str:
+    return f"{datetime.now():%Y-%m-%d_%H%M}_{safe_name(source_name)}"
+
+
+def read_job(job: str, name: str = "data.json") -> dict | None:
+    raw = storage().read(job, name)
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        return None
 
 
 def save_job(change: str = "all", summary_name: str = ""):
     """Uloží práci do složky přepisu. Volá se po každé změně.
 
-    Kvůli práci z více počítačů se nejdřív načte verze na disku a přepíše se jen to,
+    Kvůli práci z více zařízení se nejdřív načte uložená verze a přepíše se jen to,
     co se právě změnilo (change = "all" | "names" | "translation" | "summary").
-    Shrnutí vytvořené mezitím na druhém počítači se tak neztratí.
+    Shrnutí vytvořené mezitím na jiném zařízení se tak neztratí.
     """
     s = st.session_state
     if not s.job_dir:
         return
-    d = Path(s.job_dir)
-    d.mkdir(parents=True, exist_ok=True)
-    data_path = d / "data.json"
+    store = storage()
     mine = {
         "source_name": s.source_name, "minutes": s.minutes, "segments": s.segments,
         "speaker_names": s.speaker_names, "translation_raw": s.translation_raw,
         "translation_lang": s.translation_lang, "summaries": dict(s.summaries),
     }
     data = mine
-    if change != "all" and data_path.exists():
-        try:
-            data = json.loads(data_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = mine
+    if change != "all":
+        data = read_job(s.job_dir) or mine
         if change == "names":
             data["speaker_names"] = mine["speaker_names"]
         elif change == "translation":
@@ -394,35 +471,40 @@ def save_job(change: str = "all", summary_name: str = ""):
             data["translation_lang"] = mine["translation_lang"]
         elif change == "summary":
             data.setdefault("summaries", {})[summary_name] = mine["summaries"][summary_name]
-        # do otevřené relace převezmeme i změny z druhého počítače
+        # do otevřené relace převezmeme i změny z jiného zařízení
         s.speaker_names = data.get("speaker_names", {})
         s.translation_raw = data.get("translation_raw", "")
         s.translation_lang = data.get("translation_lang", "")
         s.summaries = data.get("summaries", {})
-    _write_atomic(data_path, json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8"))
-    s.job_mtime = data_path.stat().st_mtime
 
+    files = {"data.json": json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")}
     names = data.get("speaker_names", {})
     docs = transcript_documents(data, names)
-    for stem in ("prepis", "preklad", "prepis_a_preklad"):  # smaž soubory jiného uspořádání
-        if stem not in [doc[1] for doc in docs]:
-            for ext in (".txt", ".docx"):
-                (d / f"{stem}{ext}").unlink(missing_ok=True)
     for title, stem, txt, md in docs:
-        _write_atomic(d / f"{stem}.txt", txt.encode("utf-8"))
-        _write_atomic(d / f"{stem}.docx", markdown_to_docx(md, title))
+        files[f"{stem}.txt"] = txt.encode("utf-8")
+        files[f"{stem}.docx"] = markdown_to_docx(md, title)
     for name, text in data.get("summaries", {}).items():
         if change in ("all", "names") or name == summary_name:
-            _write_atomic(d / f"shrnuti_{safe_name(name)}.md", text.encode("utf-8"))
+            files[f"shrnuti_{safe_name(name)}.md"] = text.encode("utf-8")
             # Word verze se dobře čte v aplikaci Google Disk na mobilu
-            _write_atomic(d / f"shrnuti_{safe_name(name)}.docx",
-                          markdown_to_docx(text, f"{name} – {data['source_name']}"))
+            files[f"shrnuti_{safe_name(name)}.docx"] = markdown_to_docx(
+                text, f"{name} – {data['source_name']}")
+    times = store.write_many(s.job_dir, files)
+    s.job_mtime = times["data.json"]
+    s.job_checked = time.monotonic()
+    # smaž soubory jiného uspořádání (zvlášť / dohromady)
+    keep = {doc[1] for doc in docs}
+    if change in ("all", "names", "translation"):
+        store.delete(s.job_dir, [f"{stem}{ext}" for stem in ("prepis", "preklad", "prepis_a_preklad")
+                                 if stem not in keep for ext in (".txt", ".docx")])
 
 
-def load_job(folder: Path):
-    data = json.loads((folder / "data.json").read_text(encoding="utf-8"))
+def load_job(job: str):
+    data = read_job(job)
+    if not data:
+        raise RuntimeError("Přepis se nepodařilo načíst.")
     s = st.session_state
-    s.job_dir = str(folder)
+    s.job_dir = job
     s.source_name = data["source_name"]
     s.minutes = data.get("minutes", 0)
     s.segments = data["segments"]
@@ -430,31 +512,98 @@ def load_job(folder: Path):
     s.translation_raw = data.get("translation_raw", "")
     s.translation_lang = data.get("translation_lang", "")
     s.summaries = data.get("summaries", {})
-    s.job_mtime = (folder / "data.json").stat().st_mtime
+    s.job_mtime = storage().mtime(job) or 0.0
+    s.job_checked = time.monotonic()
     for k in [k for k in s if str(k).startswith("spk_")]:
         del s[k]
 
 
 def refresh_if_changed_elsewhere():
-    """Když přepis mezitím změnil druhý počítač (přes Google Disk), načte novou verzi."""
+    """Když přepis mezitím změnilo jiné zařízení, načte novou verzi.
+
+    Na Google Disku se to kvůli rychlosti kontroluje nejvýš jednou za 20 sekund.
+    """
     s = st.session_state
     if not s.job_dir:
         return
-    data_path = Path(s.job_dir) / "data.json"
+    store = storage()
+    if store.slow and time.monotonic() - s.get("job_checked", 0.0) < 20:
+        return
+    s.job_checked = time.monotonic()
     try:
-        if data_path.stat().st_mtime > s.job_mtime + 0.5:
-            load_job(Path(s.job_dir))
-            st.toast("Načtena novější verze z druhého zařízení.")
-    except OSError:
+        mtime = store.mtime(s.job_dir)
+        if mtime and mtime > s.job_mtime + 0.5:
+            load_job(s.job_dir)
+            st.toast("Načtena novější verze z jiného zařízení.")
+    except Exception:  # noqa: BLE001 – kontrola je jen pomocná
         pass
 
 
-def saved_jobs() -> list[Path]:
-    out = output_dir()
+@st.cache_data(ttl=30, show_spinner=False)
+def _list_jobs_cached(marker: str, _store, where: str) -> list[str]:
+    return _store.list_jobs(marker)
+
+
+def saved_jobs(marker: str = "data.json", fresh: bool = False) -> list[str]:
+    store = storage()
     try:
-        return sorted((p for p in out.iterdir() if (p / "data.json").exists()), reverse=True)
-    except OSError:
+        if fresh or not store.slow:
+            _list_jobs_cached.clear()
+            return store.list_jobs(marker)
+        return _list_jobs_cached(marker, store, store.describe())
+    except Exception as e:  # noqa: BLE001
+        st.sidebar.error(f"Seznam přepisů nejde načíst: {e}")
         return []
+
+
+# --- Rozpracovaný přepis: uložíme si ID úlohy, aby šel dokončit i po zavření prohlížeče -------
+
+PENDING = "rozpracovano.json"
+
+
+def finish_transcription(job: str, pending: dict, soniox_key: str, gemini_key: str,
+                         gemini_model: str, on_status):
+    """Počká na Soniox, uloží přepis a případně ho rovnou přeloží."""
+    store = storage()
+    try:
+        tokens, minutes = soniox_wait(soniox_key, pending["transcription_id"], on_status)
+    except SonioxFailed:
+        store.delete(job, [PENDING])
+        soniox_cleanup(soniox_key, pending["transcription_id"], pending.get("file_id", ""))
+        raise
+    segments = tokens_to_segments(tokens)
+    if not segments:
+        store.delete(job, [PENDING])
+        soniox_cleanup(soniox_key, pending["transcription_id"], pending.get("file_id", ""))
+        raise RuntimeError("Soniox v nahrávce nenašel žádnou řeč.")
+    on_status(f"Přepsáno {minutes:.1f} min, cena ≈ {minutes / 60 * SONIOX_USD_PER_HOUR:.3f} USD.")
+
+    s = st.session_state
+    s.source_name = pending["source_name"]
+    s.minutes = minutes
+    s.segments = segments
+    s.speaker_names = {}
+    s.translation_raw = ""
+    s.translation_lang = ""
+    s.summaries = {}
+    for k in [k for k in s if str(k).startswith("spk_")]:
+        del s[k]
+    s.job_dir = job
+    save_job()  # zaplacený přepis je uložený dřív, než začne překlad
+    store.delete(job, [PENDING])
+    soniox_cleanup(soniox_key, pending["transcription_id"], pending.get("file_id", ""))
+    _list_jobs_cached.clear()
+
+    if pending.get("translate_to"):
+        if not gemini_key:
+            raise RuntimeError("Přepis je uložený, ale pro překlad chybí Gemini API klíč.")
+        bar = st.progress(0.0, text="Překládám…")
+        s.translation_raw = translate(
+            gemini_key, gemini_model, labeled_transcript(segments), pending["translate_to"],
+            lambda i, n: bar.progress((i - 1) / n, text=f"Překládám část {i} / {n}"))
+        s.translation_lang = pending["translate_to"]
+        save_job("translation")
+
 
 
 def download_row(label: str, txt: str, md: str, base: str, key: str):
@@ -478,6 +627,84 @@ for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 
 st.set_page_config(page_title="Transcriptor", page_icon="🎙️", layout="wide")
+
+# ======================================================================================
+# Webová verze: přihlášení přes Google a připojení Google Disku
+# ======================================================================================
+
+
+def login_gate():
+    """Pustí dál jen e-maily ze Secrets → ALLOWED_EMAILS. Na PC se nepřihlašuje."""
+    if not WEB:
+        if any(k in SECRETS for k in ("SONIOX_API_KEY", "GEMINI_API_KEY", "DRIVE_REFRESH_TOKEN")):
+            # klíče na serveru bez přihlášení by mohl použít kdokoli
+            st.error("Aplikace je zamčená: v Secrets chybí sekce [auth] pro přihlášení přes Google.")
+            st.stop()
+        return
+    if not st.user.is_logged_in:
+        st.title("🎙️ Transcriptor")
+        st.write("Pro pokračování se přihlaste svým účtem Google.")
+        st.button("Přihlásit přes Google", type="primary", on_click=st.login)
+        st.stop()
+    allowed = {e.strip().lower() for e in re.split(r"[,;\s]+", cfg("ALLOWED_EMAILS")) if e.strip()}
+    email = str(st.user.get("email") or "").lower()
+    if email not in allowed or st.user.get("email_verified") is False:
+        st.title("🎙️ Transcriptor")
+        st.error(f"Účet {email or '(bez e-mailu)'} nemá do aplikace přístup.")
+        st.button("Odhlásit", on_click=st.logout)
+        st.stop()
+
+
+def drive_connect():
+    """Jednorázové povolení přístupu ke Google Disku. Výsledek se vloží do Secrets."""
+    auth = SECRETS["auth"]
+    redirect = auth["redirect_uri"].rsplit("/oauth2callback", 1)[0] + "/"
+    state = hmac.new(str(auth["cookie_secret"]).encode(), b"drive-connect", hashlib.sha256).hexdigest()
+    qp = st.query_params
+    if "code" in qp or "error" in qp:
+        st.title("🎙️ Transcriptor – připojení Google Disku")
+        if not hmac.compare_digest(qp.get("state", ""), state) or "error" in qp:
+            st.query_params.clear()
+            st.error("Povolení se nepodařilo, zkuste to znovu.")
+            st.stop()
+        try:
+            token = drive_exchange_code(auth["client_id"], auth["client_secret"], redirect, qp["code"])
+        except Exception as e:  # noqa: BLE001
+            st.query_params.clear()
+            st.error(str(e))
+            st.stop()
+        st.query_params.clear()
+        st.success("Hotovo, Google Disk povolil přístup.")
+        st.write("Zkopírujte řádek níže (ikonou vpravo v rámečku). Na share.streamlit.io otevřete "
+                 "**Settings → Secrets** této aplikace, nahraďte jím řádek `DRIVE_REFRESH_TOKEN = \"\"` "
+                 "a klikněte na **Save**. Za minutu aplikaci obnovte.")
+        st.code(f'DRIVE_REFRESH_TOKEN = "{token}"', language="toml")
+        st.stop()
+    if cfg("DRIVE_REFRESH_TOKEN") and qp.get("pripojit") != "disk":
+        return
+    st.title("🎙️ Transcriptor – připojení Google Disku")
+    st.write(f"Aplikace potřebuje jednou povolit přístup k vašemu Google Disku, aby mohla "
+             f"ukládat přepisy do složky **{cfg('DRIVE_FOLDER', 'Transcriptions')}**.")
+    st.link_button("Povolit přístup ke Google Disku", drive_auth_url(auth["client_id"], redirect, state),
+                   type="primary")
+    st.stop()
+
+
+def resume_job(job: str):
+    st.session_state.resume_job = job
+
+
+def drop_job(job: str, soniox_key: str):
+    pending = read_job(job, PENDING) or {}
+    soniox_cleanup(soniox_key, pending.get("transcription_id", ""), pending.get("file_id", ""))
+    storage().delete(job, [PENDING])
+    saved_jobs(PENDING, fresh=True)
+
+
+login_gate()
+if WEB:
+    drive_connect()
+
 st.title("🎙️ Transcriptor")
 st.caption("Přepis s určením mluvčích (Soniox) → překlad → shrnutí podle šablony (Gemini)")
 
@@ -486,43 +713,59 @@ st.caption("Přepis s určením mluvčích (Soniox) → překlad → shrnutí po
 # ======================================================================================
 
 with st.sidebar:
-    st.header("🔑 Klíče")
-    env_soniox = os.getenv("SONIOX_API_KEY", "")
-    env_gemini = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
-    soniox_key = env_soniox or st.text_input("Soniox API klíč", type="password")
-    gemini_key = env_gemini or st.text_input("Gemini API klíč", type="password")
-    if env_soniox and env_gemini:
-        st.success("Oba klíče načteny ze souboru .env")
-    elif soniox_key and gemini_key:
-        if st.button("💾 Zapamatovat klíče", use_container_width=True,
-                     help="Uloží klíče do souboru .env vedle app.py, příště se načtou samy."):
-            update_env({"SONIOX_API_KEY": soniox_key.strip(), "GEMINI_API_KEY": gemini_key.strip()})
-            st.rerun()
+    if WEB:
+        soniox_key, gemini_key = cfg("SONIOX_API_KEY"), cfg("GEMINI_API_KEY") or cfg("GOOGLE_API_KEY")
+        if not (soniox_key and gemini_key):
+            st.error("V Secrets chybí SONIOX_API_KEY nebo GEMINI_API_KEY.")
+    else:
+        st.header("🔑 Klíče")
+        env_soniox = os.getenv("SONIOX_API_KEY", "")
+        env_gemini = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+        soniox_key = env_soniox or st.text_input("Soniox API klíč", type="password")
+        gemini_key = env_gemini or st.text_input("Gemini API klíč", type="password")
+        if env_soniox and env_gemini:
+            st.success("Oba klíče načteny ze souboru .env")
+        elif soniox_key and gemini_key:
+            if st.button("💾 Zapamatovat klíče", use_container_width=True,
+                         help="Uloží klíče do souboru .env vedle app.py, příště se načtou samy."):
+                update_env({"SONIOX_API_KEY": soniox_key.strip(), "GEMINI_API_KEY": gemini_key.strip()})
+                st.rerun()
 
     st.header("⚙️ Model Gemini")
     options = GEMINI_MODELS if DEFAULT_GEMINI in GEMINI_MODELS else [DEFAULT_GEMINI, *GEMINI_MODELS]
     gemini_model = st.selectbox("Pro překlad a shrnutí", options, label_visibility="collapsed")
 
     st.header("📂 Dřívější přepisy")
-    with st.expander("Složka pro ukládání"):
-        st.caption("Pro přístup z více počítačů a mobilu sem vložte cestu do složky Google Disku, "
-                   "např. G:\\Můj disk\\Transcriptor. Na obou počítačích nastavte stejnou složku.")
-        new_dir = st.text_input("Cesta ke složce", value=str(output_dir()))
-        if st.button("Uložit složku", use_container_width=True):
-            try:
-                Path(new_dir.strip().strip('"')).mkdir(parents=True, exist_ok=True)
-                update_env({"OUTPUT_DIR": new_dir.strip().strip('"')})
-                st.rerun()
-            except OSError as e:
-                st.error(f"Složku nejde použít: {e}")
+    if WEB:
+        st.caption(f"Ukládá se do: {storage().describe()}")
+    else:
+        with st.expander("Složka pro ukládání"):
+            st.caption("Pro přístup z více počítačů a mobilu sem vložte cestu do složky Google Disku, "
+                       "např. G:\\Můj disk\\Transcriptions. Na obou počítačích nastavte stejnou složku.")
+            new_dir = st.text_input("Cesta ke složce", value=str(output_dir()))
+            if st.button("Uložit složku", use_container_width=True):
+                try:
+                    Path(new_dir.strip().strip('"')).mkdir(parents=True, exist_ok=True)
+                    update_env({"OUTPUT_DIR": new_dir.strip().strip('"')})
+                    st.rerun()
+                except OSError as e:
+                    st.error(f"Složku nejde použít: {e}")
+
     jobs = saved_jobs()
     if jobs:
-        pick = st.selectbox("Uložené", jobs, format_func=lambda p: p.name, label_visibility="collapsed")
-        if st.button("Otevřít", use_container_width=True):
-            load_job(pick)
+        pick = st.selectbox("Uložené", jobs, label_visibility="collapsed")
+        o1, o2 = st.columns([2, 1])
+        if o1.button("Otevřít", use_container_width=True):
+            try:
+                load_job(pick)
+                st.rerun()
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Přepis nejde otevřít: {e}")
+        if o2.button("🔄", use_container_width=True, help="Načíst seznam znovu"):
+            saved_jobs(fresh=True)
             st.rerun()
     else:
-        st.caption(f"Zatím nic. Přepisy se ukládají do: {output_dir()}")
+        st.caption(f"Zatím nic. Přepisy se ukládají do: {storage().describe()}")
 
     st.divider()
     if st.button("➕ Nová nahrávka", use_container_width=True):
@@ -531,15 +774,25 @@ with st.sidebar:
         for k in [k for k in st.session_state if str(k).startswith("spk_")]:
             del st.session_state[k]
         st.rerun()
+    if WEB:
+        st.button(f"Odhlásit ({st.user.get('email', '')})", on_click=st.logout, use_container_width=True)
 
 # ======================================================================================
 # 1. Přepis
 # ======================================================================================
 
 st.subheader("1. Nahrávka")
+for job in saved_jobs(PENDING):
+    st.warning(f"⏳ Rozpracovaný přepis **{job}**. Soniox ho mezitím nejspíš dokončil.")
+    p1, p2, _ = st.columns([1, 1, 2])
+    p1.button("Dokončit", key=f"resume_{job}", on_click=resume_job, args=(job,),
+              type="primary", use_container_width=True)
+    p2.button("Zahodit", key=f"drop_{job}", on_click=drop_job, args=(job, soniox_key),
+              use_container_width=True)
 uploaded = st.file_uploader(
-    f"Audio soubor (až {MAX_AUDIO_HOURS} hodin)",
-    type=["mp3", "m4a", "wav", "ogg", "flac", "aac", "webm", "mp4", "opus", "amr", "aiff"],
+    f"Audio nebo video soubor (až {MAX_AUDIO_HOURS} hodin)",
+    type=["mp3", "m4a", "wav", "ogg", "flac", "aac", "webm", "mp4", "opus", "amr", "aiff", "3gp"],
+    help="V mobilu vyberte nahrávku z Diktafonu, nahrávání obrazovky nebo jiné aplikace.",
 )
 c1, c2 = st.columns(2)
 with c1:
@@ -562,43 +815,47 @@ if st.button("▶️ Spustit přepis", type="primary", disabled=uploaded is None
     if do_translate and not gemini_key:
         st.error("Pro překlad chybí Gemini API klíč.")
         st.stop()
+    job = ""
     try:
         with st.status("Zpracovávám…", expanded=True) as status:
             line = st.empty()
-            tokens, minutes = soniox_transcribe(
-                soniox_key, uploaded.name, uploaded.getvalue(),
+            line.write("Nahrávám soubor do Sonioxu…")
+            uploaded.seek(0)
+            transcription_id, file_id = soniox_start(
+                soniox_key, uploaded.name, uploaded,
                 [AUDIO_LANGUAGES[l] for l in langs],
                 [t.strip() for t in terms_raw.split(",") if t.strip()],
-                on_status=line.write,
             )
-            segments = tokens_to_segments(tokens)
-            if not segments:
-                raise RuntimeError("Soniox v nahrávce nenašel žádnou řeč.")
-            line.write(f"Přepsáno {minutes:.1f} min, cena ≈ {minutes / 60 * SONIOX_USD_PER_HOUR:.3f} USD.")
-
-            s = st.session_state
-            s.source_name = Path(uploaded.name).stem
-            s.minutes = minutes
-            s.segments = segments
-            s.speaker_names = {}
-            s.translation_raw = ""
-            s.translation_lang = ""
-            s.summaries = {}
-            for k in [k for k in s if str(k).startswith("spk_")]:
-                del s[k]
-            s.job_dir = str(output_dir() / f"{datetime.now():%Y-%m-%d_%H%M}_{safe_name(s.source_name)}")
-            save_job()  # zaplacený přepis je uložený na disku dřív, než začne překlad
-
-            if do_translate:
-                bar = st.progress(0.0, text="Překládám…")
-                s.translation_raw = translate(
-                    gemini_key, gemini_model, labeled_transcript(segments), target_lang,
-                    lambda i, n: bar.progress((i - 1) / n, text=f"Překládám část {i} / {n}"))
-                s.translation_lang = target_lang
-                save_job("translation")
+            job = new_job_id(Path(uploaded.name).stem)
+            pending = {"transcription_id": transcription_id, "file_id": file_id,
+                       "source_name": Path(uploaded.name).stem,
+                       "translate_to": target_lang if do_translate else "",
+                       "started": datetime.now().isoformat(timespec="seconds")}
+            # kdyby se prohlížeč zavřel, přepis půjde dokončit tlačítkem „Dokončit“
+            storage().write_many(job, {PENDING: json.dumps(pending, ensure_ascii=False).encode("utf-8")})
+            line.write("Soniox přepisuje… (můžete zavřít prohlížeč, přepis půjde dokončit později)")
+            finish_transcription(job, pending, soniox_key, gemini_key, gemini_model, line.write)
             status.update(label="Hotovo ✅", state="complete", expanded=False)
     except Exception as e:  # noqa: BLE001 – uživateli ukážeme jakoukoli chybu
         st.error(f"Zpracování selhalo: {e}")
+        if job and read_job(job, PENDING):
+            st.info("Nahrávka je u Sonioxu. Přepis jde dokončit, až bude hotový.")
+            st.button("Dokončit přepis", on_click=resume_job, args=(job,), type="primary")
+
+if st.session_state.get("resume_job"):
+    job = st.session_state.pop("resume_job")
+    try:
+        pending = read_job(job, PENDING)
+        if not pending:
+            raise RuntimeError("Rozpracovaný přepis už mezitím někdo dokončil nebo zahodil.")
+        with st.status("Dokončuji rozpracovaný přepis…", expanded=True) as status:
+            line = st.empty()
+            finish_transcription(job, pending, soniox_key, gemini_key, gemini_model, line.write)
+            status.update(label="Hotovo ✅", state="complete", expanded=False)
+        saved_jobs(PENDING, fresh=True)
+        st.rerun()
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Dokončení selhalo: {e}")
 
 # ======================================================================================
 # Výsledky (čtou se jen ze session_state, takže přežijí jakékoli kliknutí)
@@ -611,7 +868,7 @@ if not S.segments:
     st.stop()
 
 st.divider()
-st.markdown(f"### 📄 {S.source_name}  \n{S.minutes:.0f} min · uloženo v `{Path(S.job_dir).name}`")
+st.markdown(f"### 📄 {S.source_name}  \n{S.minutes:.0f} min · uloženo v `{S.job_dir}`")
 
 # --- Jména mluvčích -------------------------------------------------------------------
 speakers = sorted({seg["speaker"] for seg in S.segments}, key=lambda x: (len(x), x))
@@ -643,7 +900,7 @@ if S.translation_raw:
                       index=list(LAYOUTS).index(current_layout()), horizontal=True)
     chosen_key = next(k for k, v in LAYOUTS.items() if v == chosen)
     if chosen_key != current_layout():
-        update_env({"LAYOUT": chosen_key})  # zapamatuje se i pro další nahrávky
+        set_setting("LAYOUT", chosen_key)  # zapamatuje se i pro další nahrávky
         save_job("names")                   # přegeneruje soubory ve složce
         st.rerun()
 

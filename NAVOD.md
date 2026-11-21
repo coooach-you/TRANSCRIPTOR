@@ -6,6 +6,8 @@ Potom už aplikaci spouštíte dvojklikem.
 **Co budete potřebovat:** počítač s Windows 11 nebo Windows 10 (64bitová verze), připojení k internetu, klíč Soniox a klíč Gemini
 (ty už máte).
 
+**Webová verze pro mobil a další počítače:** viz samostatný návod `NAVOD_WEB.md`.
+
 ---
 
 ## Krok 1: Nainstalujte Python
