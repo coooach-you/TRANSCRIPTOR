@@ -43,12 +43,14 @@ Tady Googlu řeknete, že aplikace Transcriptor smí přihlašovat váš účet 
 3. Název: `Transcriptor` → **Vytvořit**. Počkejte pár sekund a nahoře projekt **Transcriptor** vyberte.
 
 ### 2b. Zapněte Google Drive API
-1. Do vyhledávání nahoře napište `Google Drive API` a otevřete ho.
-2. Klikněte na **Povolit** (Enable).
+1. Zkontrolujte, že je nahoře vybraný projekt **Transcriptor**.
+2. Otevřete odkaz <https://console.cloud.google.com/apis/library/drive.googleapis.com>.
+3. Klikněte na modré tlačítko **Povolit** (Enable). Když místo něj vidíte **Spravovat** (Manage),
+   je API už zapnuté.
 
 ### 2c. Nastavte přihlašovací obrazovku
-1. Do vyhledávání napište `Google Auth Platform` (může se jmenovat i „OAuth consent screen“
-   nebo „Obrazovka souhlasu OAuth“) a otevřete ji.
+1. Otevřete odkaz <https://console.cloud.google.com/auth/overview> (stránka se jmenuje
+   „Google Auth Platform“, dříve „Obrazovka souhlasu OAuth“). Nahoře musí být vybraný projekt **Transcriptor**.
 2. Klikněte na **Začínáme** (Get started) a vyplňte:
    - Název aplikace: `Transcriptor`
    - E-mail podpory: váš e-mail
@@ -61,7 +63,7 @@ Tady Googlu řeknete, že aplikace Transcriptor smí přihlašovat váš účet 
    Google aplikaci neověřuje, to je pro osobní použití v pořádku.
 
 ### 2d. Vytvořte přístupové údaje
-1. Vlevo otevřete **Klienti** (Clients) → **Vytvořit klienta** (Create client).
+1. Vlevo otevřete **Klienti** (Clients), nebo rovnou <https://console.cloud.google.com/auth/clients>, a klikněte na **Vytvořit klienta** (Create client).
 2. Typ aplikace: **Webová aplikace** (Web application). Název: `Transcriptor`.
 3. U **Autorizované identifikátory URI přesměrování** (Authorized redirect URIs)
    klikněte dvakrát na **Přidat URI** a vložte tyto dvě adresy (NAZEV nahraďte svým):
