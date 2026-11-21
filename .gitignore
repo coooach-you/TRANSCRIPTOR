@@ -1,0 +1,7 @@
+.env
+.venv/
+venv/
+__pycache__/
+vystupy/
+.streamlit/secrets.toml
+*.tmp
