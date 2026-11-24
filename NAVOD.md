@@ -117,14 +117,20 @@ Soniox pozná, kdo mluví, ale nezná jména. Označí lidi jako „Mluvčí 1�
 2. Pod každým mluvčím je ukázka toho, co říkal. Podle ní poznáte, kdo to je.
 3. Do políčka napište jméno a stiskněte Enter.
 
-Jména se hned propíšou do přepisu, překladu i do souborů ke stažení.
+Jména se hned propíšou do celého přepisu, překladu i do souborů ke stažení.
 Pojmenujte mluvčí **ještě před generováním shrnutí**, aby v něm byla správná jména.
+
+Když Soniox omylem přiřadí kus řeči jinému člověku, opravíte to v kroku 8 v části
+**✏️ Upravit přepis** (u každého úseku jde vybrat, kdo mluví).
 
 ---
 
 ## Krok 8: Přepis, překlad a stažení
 
-- Záložka **Přepis** ukazuje text ve tvaru `[00:12:34] Aleš: …`.
+- Záložka **Přepis** ukazuje text ve tvaru `[12:34] Aleš: …`. Čas v hranatých závorkách je
+  začátek úseku v nahrávce (minuty:sekundy, u nahrávek nad hodinu i hodiny `[01:12:34]`).
+  Přepínačem **🕒 Časové značky u úseků** je skryjete nebo zase zobrazíte. Volba platí i pro
+  soubory ke stažení a pamatuje se.
 - Záložka **Překlad** se objeví, pokud jste překládali.
 - Když máte překlad, nad textem zvolíte **Uspořádání přepisu a překladu**:
   - **Zvlášť**: přepis a překlad jsou dva samostatné dokumenty (`prepis` a `preklad`).
@@ -139,6 +145,24 @@ Pojmenujte mluvčí **ještě před generováním shrnutí**, aby v něm byla sp
     (i na Google Disku) se po přepnutí hned předělají.
 - Pod textem jsou tlačítka **⬇️ TXT**, **⬇️ Markdown** a **⬇️ Word**.
 - Překlad do jiného jazyka (nebo dodatečný překlad) spustíte v části **🌍 Přeložit přepis**.
+
+### Oprava přepisu
+
+Rozbalte **✏️ Upravit přepis** (když máte překlad, nahoře zvolíte, jestli upravujete přepis,
+nebo překlad).
+
+- **Najít a nahradit v celém textu:** nejrychlejší oprava jména nebo slova, které Soniox
+  zkomolil všude. Do pole **Najít** napište špatný tvar, do **Nahradit za** správný a klikněte
+  na **Nahradit vše**. Velikost písmen nevadí.
+- **Úpravy po úsecích:** každý úsek má čas, mluvčího a text. Opravte text, případně vyberte
+  jiného mluvčího, a dole klikněte na **💾 Uložit opravy**. Smazáním celého textu se úsek
+  odstraní. Úseky jsou po 20 na stranu. Před přechodem na jinou stranu nejdřív uložte.
+  Políčkem **Zobrazit jen úseky obsahující** najdete konkrétní místo.
+- Oprava se hned uloží do složky (i na Google Disk) a propíše se do souborů ke stažení.
+- Původní přepis ze Sonioxu se schová. Tlačítkem **↩️ Vrátit původní přepis ze Sonioxu**
+  zahodíte všechny ruční opravy.
+- Překlad se po opravě přepisu sám nezmění. Opravte ho stejně (volba „překlad“) nebo
+  nechte přeložit znovu. Shrnutí po opravě vygenerujte znovu.
 
 ---
 
@@ -170,9 +194,11 @@ podsložku s datem, např. `2026-11-21_2130_porada`, a v ní:
 Přepis se uloží hned po dokončení, ještě před překladem. Zaplacená práce se tedy neztratí,
 ani když zavřete prohlížeč.
 
-**Návrat ke starší nahrávce:** v levém panelu v části **📂 Dřívější přepisy** vyberte
-nahrávku a klikněte na **Otevřít**. Můžete přejmenovat mluvčí nebo vygenerovat další shrnutí
-a za nový přepis nic neplatíte.
+**Návrat ke starší nahrávce:** když není otevřená žádná nahrávka, ukáže se na hlavní stránce
+**📚 Historie přepisů**: seznam dřívějších přepisů (nejnovější nahoře) s datem a názvem.
+Do políčka nad ním můžete napsat část názvu nebo data a klikněte u nahrávky na **Otevřít**.
+Totéž je i v levém panelu v části **📂 Dřívější přepisy**. Otevřený přepis můžete upravit,
+přejmenovat mluvčí, přeložit nebo shrnout a za nový přepis nic neplatíte.
 
 **Další nahrávka:** klikněte v levém panelu na **➕ Nová nahrávka**.
 
