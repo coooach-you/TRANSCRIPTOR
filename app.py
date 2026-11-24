@@ -203,14 +203,27 @@ def speaker_name(sid: str, names: dict) -> str:
     return names.get(sid) or f"Mluvčí {sid}"
 
 
-def render_transcript(segments: list[dict], names: dict, markdown: bool = False) -> str:
+def time_style(show: bool = True, long: bool = True):
+    """Jak zobrazit čas „00:12:34“: celý, zkráceně [12:34] (nahrávka pod hodinu), nebo vůbec."""
+    def fmt(hms: str) -> str:
+        if not show:
+            return ""
+        return f"[{hms if long else hms[3:]}] "
+    return fmt
+
+
+FULL_TIME = time_style()
+
+
+def render_transcript(segments: list[dict], names: dict, markdown: bool = False, tf=FULL_TIME) -> str:
     lines = []
     for s in segments:
         who = speaker_name(s["speaker"], names)
+        t = tf(fmt_time(s["start_ms"]))
         if markdown:
-            lines.append(f"**[{fmt_time(s['start_ms'])}] {who}:** {s['text']}")
+            lines.append(f"**{t}{who}:** {s['text']}")
         else:
-            lines.append(f"[{fmt_time(s['start_ms'])}] {who}: {s['text']}")
+            lines.append(f"{t}{who}: {s['text']}")
     return "\n\n".join(lines)
 
 
@@ -222,11 +235,55 @@ def labeled_transcript(segments: list[dict]) -> str:
     return "\n\n".join(f"[{fmt_time(s['start_ms'])}] S{s['speaker']}: {s['text']}" for s in segments)
 
 
-def render_translation(raw: str, names: dict, markdown: bool = False) -> str:
+def render_translation(raw: str, names: dict, markdown: bool = False, tf=FULL_TIME) -> str:
     def repl(m):
         who = speaker_name(m.group(2), names)
-        return f"**[{m.group(1)}] {who}:**" if markdown else f"[{m.group(1)}] {who}:"
+        t = tf(m.group(1))
+        return f"**{t}{who}:**" if markdown else f"{t}{who}:"
     return LABEL_RE.sub(repl, raw)
+
+
+def translation_rows(raw: str) -> list[dict]:
+    """Překlad jako seznam odstavců {time, speaker, text} (pro úpravy v tabulce)."""
+    matches = list(LABEL_RE.finditer(raw))
+    rows = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        rows.append({"time": m.group(1), "speaker": m.group(2),
+                     "text": re.sub(r"\s+", " ", raw[m.end():end]).strip()})
+    return rows
+
+
+def rows_to_translation(rows: list[dict]) -> str:
+    return "\n\n".join(f"[{r['time']}] S{r['speaker']}: {r['text']}" for r in rows if r["text"])
+
+
+def sync_translation_speakers(segments: list[dict], raw: str) -> str:
+    """Když se v přepisu změní mluvčí úseku, změní ho i u přeloženého úseku se stejným časem."""
+    if not raw:
+        return raw
+    by_time = {fmt_time(s["start_ms"]): s["speaker"] for s in segments}
+    rows = translation_rows(raw)
+    changed = False
+    for r in rows:
+        sp = by_time.get(r["time"], r["speaker"])
+        if sp != r["speaker"]:
+            r["speaker"], changed = sp, True
+    return rows_to_translation(rows) if changed else raw
+
+
+def replace_all(texts: list[str], find: str, repl: str, whole_word: bool) -> tuple[list[str], int]:
+    """Najít a nahradit (bez ohledu na velká a malá písmena). Vrátí nové texty a počet náhrad."""
+    pattern = re.escape(find)
+    if whole_word:
+        pattern = rf"(?<!\w){pattern}(?!\w)"
+    rx = re.compile(pattern, re.IGNORECASE)
+    total, out = 0, []
+    for t in texts:
+        new, n = rx.subn(lambda _m: repl, t)
+        out.append(new)
+        total += n
+    return out, total
 
 
 def translation_by_segment(raw: str) -> dict[tuple[str, str], str]:
@@ -239,7 +296,8 @@ def translation_by_segment(raw: str) -> dict[tuple[str, str], str]:
     return out
 
 
-def render_combined(segments: list[dict], raw: str, names: dict, markdown: bool = False) -> str:
+def render_combined(segments: list[dict], raw: str, names: dict, markdown: bool = False,
+                    tf=FULL_TIME) -> str:
     """Dohromady: úsek originálu a hned pod ním jeho překlad."""
     tr = translation_by_segment(raw)
     blocks = []
@@ -248,9 +306,9 @@ def render_combined(segments: list[dict], raw: str, names: dict, markdown: bool 
         who = speaker_name(s["speaker"], names)
         translated = tr.get((t, s["speaker"]), "(překlad tohoto úseku chybí)")
         if markdown:
-            blocks.append(f"**[{t}] {who}:** {s['text']}\n\n*{translated}*")
+            blocks.append(f"**{tf(t)}{who}:** {s['text']}\n\n*{translated}*")
         else:
-            blocks.append(f"[{t}] {who}: {s['text']}\n» {translated}")
+            blocks.append(f"{tf(t)}{who}: {s['text']}\n» {translated}")
     return "\n\n".join(blocks)
 
 
@@ -263,17 +321,23 @@ def current_layout() -> str:
     return layout if layout in LAYOUTS else "separate"
 
 
+def show_times() -> bool:
+    return get_setting("TIMESTAMPS") != "off"
+
+
 def transcript_documents(data: dict, names: dict) -> list[tuple[str, str, str, str]]:
     """Dokumenty podle zvoleného uspořádání: (název, soubor, text, markdown)."""
     segs, raw, src = data["segments"], data.get("translation_raw", ""), data["source_name"]
+    long = bool(segs) and segs[-1]["start_ms"] >= 3_600_000  # nad hodinu i hodiny, jinak [12:34]
+    tf = time_style(show_times(), long)
     if raw and current_layout() == "combined":
         return [(f"Přepis a překlad – {src}", "prepis_a_preklad",
-                 render_combined(segs, raw, names), render_combined(segs, raw, names, True))]
+                 render_combined(segs, raw, names, tf=tf), render_combined(segs, raw, names, True, tf))]
     docs = [(f"Přepis – {src}", "prepis",
-             render_transcript(segs, names), render_transcript(segs, names, True))]
+             render_transcript(segs, names, tf=tf), render_transcript(segs, names, True, tf))]
     if raw:
         docs.append((f"Překlad – {src}", "preklad",
-                     render_translation(raw, names), render_translation(raw, names, True)))
+                     render_translation(raw, names, tf=tf), render_translation(raw, names, True, tf)))
     return docs
 
 
@@ -437,6 +501,15 @@ def new_job_id(source_name: str) -> str:
     return f"{datetime.now():%Y-%m-%d_%H%M}_{safe_name(source_name)}"
 
 
+def job_label(job: str) -> str:
+    """„2026-11-24_1057_porada“ → „24. 11. 2026 10:57 · porada“."""
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)_(\d\d)(\d\d)_(.*)", job)
+    if not m:
+        return job
+    y, mo, d, h, mi, name = m.groups()
+    return f"{int(d)}. {int(mo)}. {y} {h}:{mi} · {name.replace('_', ' ')}"
+
+
 def read_job(job: str, name: str = "data.json") -> dict | None:
     raw = storage().read(job, name)
     try:
@@ -449,7 +522,7 @@ def save_job(change: str = "all", summary_name: str = ""):
     """Uloží práci do složky přepisu. Volá se po každé změně.
 
     Kvůli práci z více zařízení se nejdřív načte uložená verze a přepíše se jen to,
-    co se právě změnilo (change = "all" | "names" | "translation" | "summary").
+    co se právě změnilo (change = "all" | "names" | "translation" | "summary" | "edit").
     Shrnutí vytvořené mezitím na jiném zařízení se tak neztratí.
     """
     s = st.session_state
@@ -461,6 +534,8 @@ def save_job(change: str = "all", summary_name: str = ""):
         "speaker_names": s.speaker_names, "translation_raw": s.translation_raw,
         "translation_lang": s.translation_lang, "summaries": dict(s.summaries),
     }
+    if s.original_segments:
+        mine["original_segments"] = s.original_segments
     data = mine
     if change != "all":
         data = read_job(s.job_dir) or mine
@@ -471,6 +546,14 @@ def save_job(change: str = "all", summary_name: str = ""):
             data["translation_lang"] = mine["translation_lang"]
         elif change == "summary":
             data.setdefault("summaries", {})[summary_name] = mine["summaries"][summary_name]
+        elif change == "edit":  # opravený přepis nebo překlad
+            data["segments"] = mine["segments"]
+            data["translation_raw"] = mine["translation_raw"]
+            data["speaker_names"] = mine["speaker_names"]
+            if "original_segments" in mine:
+                data.setdefault("original_segments", mine["original_segments"])
+        s.segments = data.get("segments", s.segments)
+        s.original_segments = data.get("original_segments", [])
         # do otevřené relace převezmeme i změny z jiného zařízení
         s.speaker_names = data.get("speaker_names", {})
         s.translation_raw = data.get("translation_raw", "")
@@ -484,7 +567,7 @@ def save_job(change: str = "all", summary_name: str = ""):
         files[f"{stem}.txt"] = txt.encode("utf-8")
         files[f"{stem}.docx"] = markdown_to_docx(md, title)
     for name, text in data.get("summaries", {}).items():
-        if change in ("all", "names") or name == summary_name:
+        if change in ("all", "names", "edit") or name == summary_name:
             files[f"shrnuti_{safe_name(name)}.md"] = text.encode("utf-8")
             # Word verze se dobře čte v aplikaci Google Disk na mobilu
             files[f"shrnuti_{safe_name(name)}.docx"] = markdown_to_docx(
@@ -494,7 +577,7 @@ def save_job(change: str = "all", summary_name: str = ""):
     s.job_checked = time.monotonic()
     # smaž soubory jiného uspořádání (zvlášť / dohromady)
     keep = {doc[1] for doc in docs}
-    if change in ("all", "names", "translation"):
+    if change in ("all", "names", "translation", "edit"):
         store.delete(s.job_dir, [f"{stem}{ext}" for stem in ("prepis", "preklad", "prepis_a_preklad")
                                  if stem not in keep for ext in (".txt", ".docx")])
 
@@ -512,6 +595,8 @@ def load_job(job: str):
     s.translation_raw = data.get("translation_raw", "")
     s.translation_lang = data.get("translation_lang", "")
     s.summaries = data.get("summaries", {})
+    s.original_segments = data.get("original_segments", [])
+    s.edit_rev = s.get("edit_rev", 0) + 1
     s.job_mtime = storage().mtime(job) or 0.0
     s.job_checked = time.monotonic()
     for k in [k for k in s if str(k).startswith("spk_")]:
@@ -586,6 +671,8 @@ def finish_transcription(job: str, pending: dict, soniox_key: str, gemini_key: s
     s.translation_raw = ""
     s.translation_lang = ""
     s.summaries = {}
+    s.original_segments = []
+    s.edit_rev = s.get("edit_rev", 0) + 1
     for k in [k for k in s if str(k).startswith("spk_")]:
         del s[k]
     s.job_dir = job
@@ -622,7 +709,8 @@ def download_row(label: str, txt: str, md: str, base: str, key: str):
 # ======================================================================================
 
 DEFAULTS = {"job_dir": "", "job_mtime": 0.0, "source_name": "", "minutes": 0.0, "segments": [],
-            "speaker_names": {}, "translation_raw": "", "translation_lang": "", "summaries": {}}
+            "speaker_names": {}, "translation_raw": "", "translation_lang": "", "summaries": {},
+            "original_segments": []}
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
 
@@ -753,7 +841,8 @@ with st.sidebar:
 
     jobs = saved_jobs()
     if jobs:
-        pick = st.selectbox("Uložené", jobs, label_visibility="collapsed")
+        pick = st.selectbox("Uložené", jobs, format_func=job_label, label_visibility="collapsed",
+                            help="Do pole jde psát, seznam se podle toho zúží.")
         o1, o2 = st.columns([2, 1])
         if o1.button("Otevřít", use_container_width=True):
             try:
@@ -865,10 +954,38 @@ S = st.session_state
 refresh_if_changed_elsewhere()
 if not S.segments:
     st.info("Nahrajte audio soubor a klikněte na „Spustit přepis“.")
+    history = saved_jobs()
+    if history:
+        st.subheader("📚 Historie přepisů")
+        st.caption("Dřívější přepisy z " + storage().describe() + ". Po otevření je jde upravit, "
+                   "přeložit i shrnout.")
+        h1, h2 = st.columns([3, 1])
+        query = h1.text_input("Hledat podle názvu nebo data", placeholder="např. porada nebo 11. 2026",
+                              label_visibility="collapsed")
+        if h2.button("🔄 Obnovit seznam", use_container_width=True):
+            saved_jobs(fresh=True)
+            st.rerun()
+        q = query.strip().lower()
+        found = [j for j in history if not q or q in job_label(j).lower() or q in j.lower()]
+        limit = 15 if not q else 50
+        for job in found[:limit]:
+            r1, r2 = st.columns([4, 1])
+            r1.markdown(f"**{job_label(job)}**")
+            if r2.button("Otevřít", key=f"hist_{job}", use_container_width=True):
+                try:
+                    load_job(job)
+                    st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Přepis nejde otevřít: {e}")
+        if len(found) > limit:
+            st.caption(f"…a dalších {len(found) - limit}. Zužte hledání.")
+        elif not found:
+            st.caption("Nic nenalezeno.")
     st.stop()
 
 st.divider()
-st.markdown(f"### 📄 {S.source_name}  \n{S.minutes:.0f} min · uloženo v `{S.job_dir}`")
+st.markdown(f"### 📄 {S.source_name}  \n{S.minutes:.0f} min · {job_label(S.job_dir)} · "
+            f"uloženo v `{S.job_dir}`")
 
 # --- Jména mluvčích -------------------------------------------------------------------
 speakers = sorted({seg["speaker"] for seg in S.segments}, key=lambda x: (len(x), x))
@@ -904,6 +1021,14 @@ if S.translation_raw:
         save_job("names")                   # přegeneruje soubory ve složce
         st.rerun()
 
+times_on = st.toggle("🕒 Časové značky u úseků", value=show_times(),
+                     help="Čas začátku úseku, např. [12:34], podle kterého najdete místo v nahrávce. "
+                          "Platí i pro stažené a uložené soubory a zapamatuje se.")
+if times_on != show_times():
+    set_setting("TIMESTAMPS", "on" if times_on else "off")
+    save_job("names")  # přegeneruje soubory ve složce
+    st.rerun()
+
 docs = transcript_documents(
     {"segments": S.segments, "translation_raw": S.translation_raw, "source_name": S.source_name},
     names)
@@ -912,7 +1037,126 @@ tab_labels = [title.split(" – ")[0] + (f" ({S.translation_lang})" if "řeklad"
 for tab, (title, stem, txt, md) in zip(st.tabs(tab_labels), docs):
     with tab:
         st.text_area(title, txt, height=400, label_visibility="collapsed")
+        st.caption("Tady text jen čtete. Opravy dělejte níže v části ✏️ Upravit přepis.")
         download_row(title, txt, md, f"{base}_{stem}", f"dl_{stem}")
+
+# --- Úpravy přepisu a překladu ----------------------------------------------------------
+EDIT_PAGE = 20  # úseků na jednu stranu
+
+
+def edit_section():
+    rev = S.get("edit_rev", 0)
+    what = "přepis"
+    if S.translation_raw:
+        what = st.radio("Co upravit", ["přepis", "překlad"], horizontal=True, key="edit_what")
+    is_tr = what == "překlad"
+
+    # Najít a nahradit: rychlá oprava jména nebo slova, které Soniox zkomolil všude
+    st.markdown("**Najít a nahradit v celém textu**")
+    f1, f2 = st.columns(2)
+    find = f1.text_input("Najít", key=f"find_{rev}", placeholder="např. Jiří Novák")
+    repl = f2.text_input("Nahradit za", key=f"repl_{rev}", placeholder="např. Jiří Nowak")
+    f3, f4 = st.columns([1, 1])
+    whole = f3.checkbox("Jen celá slova", value=True, key=f"whole_{rev}")
+    if f4.button("Nahradit vše", use_container_width=True):
+        if not find.strip():
+            st.warning("Napište do pole Najít, co se má nahradit.")
+            return
+        if is_tr:
+            rows = translation_rows(S.translation_raw)
+            texts, n = replace_all([r["text"] for r in rows], find.strip(), repl.strip(), whole)
+            for r, t in zip(rows, texts):
+                r["text"] = t
+            new_raw = rows_to_translation(rows)
+        else:
+            texts, n = replace_all([seg["text"] for seg in S.segments], find.strip(), repl.strip(), whole)
+        if n:
+            if is_tr:
+                S.translation_raw = new_raw
+            else:
+                if not S.original_segments:
+                    S.original_segments = [dict(seg) for seg in S.segments]
+                S.segments = [{**seg, "text": t} for seg, t in zip(S.segments, texts)]
+            save_job("edit")
+            S.edit_rev = rev + 1
+            S.edit_msg = f"Nahrazeno {n}× a uloženo."
+            st.rerun()
+        else:
+            st.warning(f"„{find.strip()}“ se v textu nenašlo.")
+
+    st.divider()
+    st.markdown("**Úpravy po úsecích**")
+    if is_tr:
+        items = translation_rows(S.translation_raw)
+    else:
+        items = [{"time": fmt_time(seg["start_ms"]), "speaker": seg["speaker"], "text": seg["text"]}
+                 for seg in S.segments]
+    flt = st.text_input("Zobrazit jen úseky obsahující (nepovinné)", key=f"flt_{rev}_{what}")
+    idx = [i for i, it in enumerate(items) if not flt.strip() or flt.strip().lower() in it["text"].lower()]
+    if not idx:
+        st.caption("Žádný úsek neodpovídá.")
+        return
+    pages = (len(idx) - 1) // EDIT_PAGE + 1
+    page = 1
+    if pages > 1:
+        page = st.selectbox(f"Strana (po {EDIT_PAGE} úsecích)", range(1, pages + 1), key=f"page_{rev}_{what}",
+                            format_func=lambda n: f"{n} / {pages}  (od {items[idx[(n - 1) * EDIT_PAGE]]['time']})")
+    shown = idx[(page - 1) * EDIT_PAGE: page * EDIT_PAGE]
+
+    speakers_all = sorted({seg["speaker"] for seg in S.segments}, key=lambda x: (len(x), x))
+    with st.form(f"edit_{rev}_{what}_{page}_{flt.strip()}"):
+        st.caption("Opravte text a klikněte na Uložit dole. Smazáním celého textu se úsek odstraní. "
+                   "Před přechodem na jinou stranu nejdřív uložte.")
+        for i in shown:
+            it = items[i]
+            if is_tr:
+                st.caption(f"[{it['time']}] {speaker_name(it['speaker'], names)}")
+            else:
+                c1, c2 = st.columns([1, 2])
+                c1.caption(f"[{it['time']}]")
+                c2.selectbox("Mluvčí", speakers_all, index=speakers_all.index(it["speaker"]),
+                             format_func=lambda sid: speaker_name(sid, names),
+                             key=f"es_{rev}_{i}", label_visibility="collapsed")
+            st.text_area("Text", it["text"], key=f"et_{rev}_{what}_{i}", label_visibility="collapsed",
+                         height=max(68, min(300, 24 * (len(it["text"]) // 90 + 2))))
+        saved = st.form_submit_button("💾 Uložit opravy", type="primary", use_container_width=True)
+    if saved:
+        if is_tr:
+            for i in shown:
+                items[i]["text"] = re.sub(r"\s+", " ", S[f"et_{rev}_{what}_{i}"]).strip()
+            S.translation_raw = rows_to_translation(items)
+        else:
+            if not S.original_segments:
+                S.original_segments = [dict(seg) for seg in S.segments]
+            new = [dict(seg) for seg in S.segments]
+            for i in shown:
+                new[i]["text"] = re.sub(r"\s+", " ", S[f"et_{rev}_{what}_{i}"]).strip()
+                new[i]["speaker"] = S[f"es_{rev}_{i}"]
+            S.segments = [seg for seg in new if seg["text"]]
+            S.translation_raw = sync_translation_speakers(S.segments, S.translation_raw)
+        save_job("edit")
+        S.edit_rev = rev + 1
+        S.edit_msg = "Opravy uloženy."
+        st.rerun()
+
+    if S.original_segments and not is_tr:
+        st.divider()
+        if st.button("↩️ Vrátit původní přepis ze Sonioxu",
+                     help="Zahodí všechny ruční opravy přepisu. Překlad a shrnutí zůstanou."):
+            S.segments = [dict(seg) for seg in S.original_segments]
+            S.translation_raw = sync_translation_speakers(S.segments, S.translation_raw)
+            save_job("edit")
+            S.edit_rev = rev + 1
+            S.edit_msg = "Vrácen původní přepis."
+            st.rerun()
+
+
+if msg := S.pop("edit_msg", ""):
+    st.toast(msg, icon="✅")
+with st.expander("✏️ Upravit přepis" + (" nebo překlad" if S.translation_raw else "")):
+    edit_section()
+    if S.original_segments and S.translation_raw:
+        st.caption("Překlad se po opravě přepisu sám nemění. Opravte ho zde, nebo nechte přeložit znovu.")
 
 with st.expander("🌍 " + ("Přeložit znovu do jiného jazyka" if S.translation_raw else "Přeložit přepis")):
     t1, t2 = st.columns([2, 1])

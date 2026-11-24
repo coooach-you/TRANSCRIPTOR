@@ -149,7 +149,9 @@ Aplikace je chráněná přihlášením přes Google, takže nevadí, že GitHub
 3. Klepněte na **Browse files** (Procházet soubory) a vyberte nahrávku.
 4. Klepněte na **Spustit přepis**.
 
-Dřívější přepisy najdete pod šipkou **»** vlevo nahoře (postranní panel).
+Dřívější přepisy najdete na úvodní stránce v části **📚 Historie přepisů** (dokud nemáte
+otevřenou žádnou nahrávku), nebo pod šipkou **»** vlevo nahoře (postranní panel).
+Po klepnutí na **➕ Nová nahrávka** v postranním panelu se historie ukáže znovu.
 
 **Když zavřete prohlížeč během přepisu:** nic se neztratí. Při dalším otevření se nahoře
 ukáže **„Rozpracovaný přepis“** a tlačítko **Dokončit**.
